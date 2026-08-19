@@ -6,6 +6,11 @@ services:
     volumes:
       - ${APP_DATA_DIR:-./data}:/app/data:z
       - ${APP_LOGS_DIR:-./logs}:/app/logs:z
+      # Vault indexer. Lives in scripts/ so it is version-controlled (data/ is
+      # gitignored), but is mounted at its historical /app/data path so cron,
+      # docs and VAULT_PATH invocations keep working. Bind-mounted rather than
+      # baked in so edits take effect without an image rebuild.
+      - ./scripts/reindex_vault.py:/app/data/reindex_vault.py:ro
       # Cookbook remote-server SSH identity. Odysseus can generate a key here;
       # add the shown public key to each remote server's authorized_keys.
       - ${APP_DATA_DIR:-./data}/ssh:/app/.ssh:z
