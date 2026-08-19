@@ -104,6 +104,134 @@ def _append_incognito_message(session_id: str, role: str, content: Any, metadata
     bundle["updated_at"] = time.time()
 
 
+# ── Model-driven persistent memory (Chat mode) ──────────────────────────── #
+#
+# Local models served via Ollama never receive the native `manage_memory`
+# tool (the agent loop forces text-mode for ollama endpoints unless the user
+# flips supports_tools=True), and Chat mode has no tools at all. To let the
+# assistant DELIBERATELY persist a fact while chatting on a local model, it
+# emits a `<remember>the fact</remember>` directive in its reply. We strip the
+# directive from the stream (so the user never sees the tag) and save the
+# captured text to the owner's memory. Recall already works in Chat mode via
+# chat_processor.build_context_preface, so this closes the write half.
+#
+# The sentinel is a tag (not a `[[...]]` marker) on purpose: it can't collide
+# with Obsidian-style wikilinks the model might legitimately emit, and it
+# matches the <think> tag style qwen3 already produces.
+
+MEMORY_DIRECTIVE_OPEN = "<remember>"
+MEMORY_DIRECTIVE_CLOSE = "</remember>"
+
+
+class MemoryDirectiveFilter:
+    """Incrementally strip ``<remember>...</remember>`` from a streamed reply.
+
+    Feed token deltas in order; ``feed`` returns the text safe to show the
+    user (directive spans removed) and accumulates the captured facts in
+    ``self.captured``. Because deltas arrive split at arbitrary boundaries, a
+    trailing fragment that could still be growing into the open tag is held
+    back until the next ``feed`` (or ``flush`` at end of stream) resolves it.
+    """
+
+    def __init__(self):
+        self._buf = ""
+        self._in_directive = False
+        self.captured: list[str] = []
+
+    def feed(self, text: str) -> str:
+        self._buf += text
+        out: list[str] = []
+        while True:
+            if not self._in_directive:
+                idx = self._buf.find(MEMORY_DIRECTIVE_OPEN)
+                if idx != -1:
+                    out.append(self._buf[:idx])
+                    self._buf = self._buf[idx + len(MEMORY_DIRECTIVE_OPEN):]
+                    self._in_directive = True
+                    continue
+                # No complete open tag. Emit everything except a tail that
+                # could still be the start of the open tag on the next delta.
+                emit, self._buf = self._split_keeping_prefix(self._buf, MEMORY_DIRECTIVE_OPEN)
+                out.append(emit)
+                break
+            else:
+                idx = self._buf.find(MEMORY_DIRECTIVE_CLOSE)
+                if idx != -1:
+                    self.captured.append(self._buf[:idx].strip())
+                    self._buf = self._buf[idx + len(MEMORY_DIRECTIVE_CLOSE):]
+                    self._in_directive = False
+                    continue
+                # Inside a directive with no close yet — hold the whole buffer
+                # (it's directive content, never shown) until the tag closes.
+                break
+        return "".join(out)
+
+    def flush(self) -> str:
+        """End of stream. Return any held-back non-directive tail to show."""
+        if self._in_directive:
+            # Unclosed directive: treat the buffered remainder as the fact so a
+            # model that forgot the closing tag still persists something, and
+            # never leak the tag text to the user.
+            tail = self._buf.strip()
+            if tail:
+                self.captured.append(tail)
+            self._buf = ""
+            self._in_directive = False
+            return ""
+        out = self._buf
+        self._buf = ""
+        return out
+
+    @staticmethod
+    def _split_keeping_prefix(buf: str, marker: str) -> tuple[str, str]:
+        """Split buf into (emit-now, hold-back) where hold-back is the longest
+        suffix of buf that is a proper prefix of marker (a possibly-incomplete
+        open tag spanning the next delta)."""
+        max_hold = min(len(buf), len(marker) - 1)
+        for k in range(max_hold, 0, -1):
+            if buf[-k:] == marker[:k]:
+                return buf[:-k], buf[-k:]
+        return buf, ""
+
+
+def persist_directive_memories(memory_manager, memory_vector, captured, owner) -> list[str]:
+    """Save facts captured from <remember> directives. Returns the texts saved.
+
+    Owner-scoped, deduplicated against the owner's existing memories, and
+    synced into the vector index when one is available. Mirrors the
+    /api/memory/add route so directive-saved and UI-saved memories are
+    indistinguishable downstream.
+    """
+    saved: list[str] = []
+    if not captured:
+        return saved
+    all_mem = memory_manager.load_all()
+    user_mem = [m for m in all_mem if owner is None or m.get("owner") == owner]
+    for raw in captured:
+        text = (raw or "").strip()
+        if not text:
+            continue
+        if memory_manager.find_duplicates(text, user_mem):
+            continue
+        entry = memory_manager.add_entry(text, source="assistant", category="fact", owner=owner)
+        all_mem.append(entry)
+        user_mem.append(entry)
+        saved.append(text)
+        if memory_vector and getattr(memory_vector, "healthy", False):
+            try:
+                memory_vector.add(entry["id"], text)
+            except Exception:
+                logger.debug("vector add failed for directive memory", exc_info=True)
+    if saved:
+        memory_manager.save(all_mem)
+        try:
+            from src.event_bus import fire_event
+            fire_event("memory_added", owner)
+        except Exception:
+            logger.debug("memory_added event dispatch failed", exc_info=True)
+    return saved
+
+
 # ── Data containers ────────────────────────────────────────────────────── #
 
 @dataclass
@@ -738,6 +866,28 @@ async def build_chat_context(
 
     # Capture used memories immediately
     used_memories = getattr(chat_processor, '_last_used_memories', [])
+
+    # Teach the model the Chat-mode write path. Agent mode uses the native
+    # manage_memory tool instead, and incognito/memory-off must not persist
+    # anything — so only offer the directive when memory injection is active
+    # and we're in plain Chat mode.
+    if mem_enabled and not agent_mode and not incognito:
+        preface.append({
+            "role": "system",
+            "content": (
+                "PERSISTENT MEMORY (write): When the user shares a durable fact "
+                "worth recalling in future conversations — their name, stable "
+                "preferences, important people or places, ongoing projects, or "
+                "long-term goals — save it by appending a line "
+                "`<remember>the fact</remember>` at the very END of your reply. "
+                "Write ONE concise, self-contained fact per tag (multiple tags "
+                "allowed). The tag is stripped before the user sees it and the "
+                "fact is stored automatically with a short confirmation, so do "
+                "NOT announce that you saved anything or mention the tag. Do NOT "
+                "use it for trivia, transient details, or facts already shown to "
+                "you under 'saved memory'."
+            ),
+        })
 
     # Inject pre-fetched search context (compare mode)
     if search_context and allow_tool_preprocessing and not casual_low_signal:

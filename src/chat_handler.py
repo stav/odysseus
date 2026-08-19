@@ -333,11 +333,18 @@ class ChatHandler:
             message
         )
         if is_memory_cmd and memory_text:
-            mem = self.memory_manager.load()
-            if not self.memory_manager.find_duplicates(memory_text, mem):
-                new_entry = self.memory_manager.add_entry(memory_text)
-                mem.append(new_entry)
-                self.memory_manager.save(mem)
+            # Tag the entry with the session owner. Saving ownerless orphaned
+            # these memories out of the owner-filtered views (load(owner=...)),
+            # so a user's "remember: X" silently vanished from their brain panel
+            # and never came back via recall. Dedup within the owner's slice but
+            # persist the FULL list so other tenants' entries are preserved.
+            owner = getattr(session, "owner", None)
+            all_mem = self.memory_manager.load_all()
+            user_mem = [m for m in all_mem if owner is None or m.get("owner") == owner]
+            if not self.memory_manager.find_duplicates(memory_text, user_mem):
+                new_entry = self.memory_manager.add_entry(memory_text, owner=owner)
+                all_mem.append(new_entry)
+                self.memory_manager.save(all_mem)
 
             session.add_message(ChatMessage("user", message))
             session.add_message(

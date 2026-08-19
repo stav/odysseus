@@ -64,6 +64,8 @@ from routes.chat_helpers import (
     clean_thinking_for_save,
     _allowed_models_for_request,
     _enforce_chat_privileges,
+    MemoryDirectiveFilter,
+    persist_directive_memories,
 )
 from src.action_intents import ToolIntent, classify_tool_intent as _classify_tool_intent
 from src.image_model_ids import looks_like_image_generation_model
@@ -1970,6 +1972,9 @@ def setup_chat_routes(
                     )
 
                 # ── Chat mode: call stream_llm directly, NO tools, NO document access ──
+                # Strip any <remember>…</remember> directives the model emits so the
+                # tag never reaches the user; captured facts are persisted at [DONE].
+                _mem_filter = MemoryDirectiveFilter()
                 try:
                     async for chunk in stream_llm_with_fallback(
                         _foreground_candidates,
@@ -2005,10 +2010,21 @@ def setup_chat_routes(
                                     # reply (mirrors the rewrite path below).
                                     if data.get("thinking"):
                                         thinking_response += data["delta"]
+                                        yield chunk
                                     else:
-                                        full_response += data["delta"]
-                                        _stream_set(session, partial=full_response)
-                                    yield chunk
+                                        # Route visible text through the memory-directive filter: it
+                                        # removes <remember>…</remember> spans and may hold back a
+                                        # trailing fragment still growing into the open tag.
+                                        _visible = _mem_filter.feed(data["delta"])
+                                        if _visible:
+                                            full_response += _visible
+                                            _stream_set(session, partial=full_response)
+                                            if _visible == data["delta"]:
+                                                yield chunk
+                                            else:
+                                                data["delta"] = _visible
+                                                yield f'data: {json.dumps(data)}\n\n'
+                                        # else: fully held back this delta — emit nothing
                                 elif data.get("type") == "fallback":
                                     # Selected model failed; a fallback answered.
                                     # Forward the notice and remember the real model.
@@ -2204,6 +2220,23 @@ def setup_chat_routes(
                                 # never re-save/post-process it as a success or
                                 # advertise successful completion to the client.
                                 continue
+                            # Flush any text the directive filter was holding back,
+                            # then persist captured <remember> facts and surface a
+                            # subtle confirmation. Both the tail and the confirmation
+                            # are folded into full_response so the saved bubble matches
+                            # what the user sees. Incognito never persists.
+                            _tail = _mem_filter.flush()
+                            if _tail:
+                                full_response += _tail
+                                yield f'data: {json.dumps({"delta": _tail})}\n\n'
+                            if _mem_filter.captured and not incognito:
+                                _saved_facts = persist_directive_memories(
+                                    memory_manager, memory_vector, _mem_filter.captured, _user,
+                                )
+                                if _saved_facts:
+                                    _confirm = "\n\n> 🧠 Saved to memory: " + "; ".join(_saved_facts)
+                                    full_response += _confirm
+                                    yield f'data: {json.dumps({"delta": _confirm})}\n\n'
                             # Generate fallback metrics if LLM didn't send usage
                             if not last_metrics and full_response:
                                 _elapsed = time.time() - _chat_start
